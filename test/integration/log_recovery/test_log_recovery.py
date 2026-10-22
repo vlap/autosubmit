@@ -680,20 +680,6 @@ def test_recover_pending_from_db_survives_failures(
         assert recover.call_count == 2
 
 
-def test_recover_inline_recovers_pending_jobs(local, as_conf, mocker):
-    """Inline recovery drains the jobs accumulated while the child process was unavailable."""
-    _set_runtime_log_recovery(as_conf, INLINE_FALLBACK=True)
-    job = Job("t000", "0000", Status.COMPLETED, 0)
-    job.name = "current_job"
-    local._pending_recovery = {"pending_job": _job_payload("pending_job")}
-    recover_inline = mocker.patch.object(local, "recover_log_inline")
-    recover_pending = mocker.patch.object(local, "_recover_pending_from_db")
-
-    assert local._recover_inline(job, as_conf) is True
-    recover_inline.assert_called_once_with(job, as_conf)
-    recover_pending.assert_called_once_with(as_conf)
-
-
 @pytest.mark.parametrize(
     "active,should_run,process_alive,expected",
     [

@@ -34,7 +34,7 @@ import setproctitle
 from autosubmit.config.runtime import LogRecoveryConfig, resolve_log_recovery_queue_size
 from autosubmit.helpers.parameters import autosubmit_parameter
 from autosubmit.job.job_common import Status
-from autosubmit.log.log import Log
+from autosubmit.log.log import AutosubmitCritical, Log
 
 if TYPE_CHECKING:
     from autosubmit.config.configcommon import AutosubmitConfig
@@ -59,6 +59,7 @@ def recover_platform_job_logs_wrapper(
         recovery_queue: 'CopyQueue',
         worker_event: Event,
         cleanup_event: Event,
+        ready_event: Event,
         as_conf: 'AutosubmitConfig',
         recovery_results: Optional[Any]
 ) -> None:
@@ -68,6 +69,7 @@ def recover_platform_job_logs_wrapper(
     :param recovery_queue: A multiprocessing queue used to store jobs for recovery.
     :param worker_event: An event to signal work availability.
     :param cleanup_event: An event to signal cleanup operations.
+    :param ready_event: An event the child sets once it has connected successfully.
     :param as_conf: The Autosubmit configuration object containing experiment data.
     :type as_conf: AutosubmitConfig
     :param recovery_results: Optional queue used by the child to acknowledge processed jobs.
@@ -78,6 +80,7 @@ def recover_platform_job_logs_wrapper(
     platform.recovery_results = recovery_results
     platform.work_event = worker_event
     platform.cleanup_event = cleanup_event
+    platform._log_recovery_ready = ready_event
     as_conf.experiment_data = {
         "AS_ENV_PLATFORMS_PATH": as_conf.experiment_data.get("AS_ENV_PLATFORMS_PATH", None),
         "AS_ENV_SSH_CONFIG_PATH": as_conf.experiment_data.get("AS_ENV_SSH_CONFIG_PATH", None),
@@ -93,9 +96,6 @@ def recover_platform_job_logs_wrapper(
     }
     _init_logs_log_process(as_conf, platform.name)
     platform.recover_platform_job_logs(as_conf)
-    # Exit userspace after manually closing ssh sockets, recommended for child processes,
-    # the queue() and shared signals should be in charge of the main process.
-    _exit(0)
 
 
 class CopyQueue(Queue):
@@ -236,6 +236,7 @@ class Platform:
         self._log_recovery_in_backoff: bool = False
         self._log_recovery_retry_at: float = 0.0
         self._log_recovery_started_at: float = 0.0
+        self._log_recovery_ready: Optional[Event] = None
         self.keep_alive_timeout = 60 * 5  # Useful in case of kill -9
         self.compress_remote_logs = False
         self.remote_logs_compress_type = "gzip"
@@ -851,8 +852,8 @@ class Platform:
         self._log_recovery_in_backoff = True
         self._recovery_consecutive_failures = 0
         Log.error(
-            f"[{self.name}] Log recovery process failed to start after {attempts} consecutive "
-            f"attempt(s). Retrying in {log_recovery.retry_delay} seconds.")
+            f"[{self.name}] Log recovery process failed {attempts} consecutive "
+            f"time(s). Retrying in {log_recovery.retry_delay} seconds.")
         if log_recovery.inline_fallback:
             Log.warning(f"[{self.name}] Recovering pending logs inline while waiting for the retry.")
             self._recover_pending_inline(as_conf)
@@ -863,8 +864,13 @@ class Platform:
         """Ensure a log recovery process is running when one is expected.
 
         Safe to call periodically: it only restarts a dead process and respects the retry
-        backoff configured under ``RUNTIME.LOG_RECOVERY``. A process that starts and dies
-        shortly after counts as a failed attempt, so a crash loop eventually backs off.
+        backoff configured under ``RUNTIME.LOG_RECOVERY``.
+
+        A successful spawn only proves that the child started, not that it stayed alive.
+        The child sets ``_log_recovery_ready`` after a verified connection.
+        A child that died without setting the event is a startup failure.
+        A child that set the event but exited non-zero is a post-init crash.
+        A child that set the event and exited zero is a normal idle or cleanup exit.
 
         :param as_conf: Experiment configuration.
         :return: ``True`` when a live recovery process is running.
@@ -876,18 +882,45 @@ class Platform:
         log_recovery = Platform._log_recovery_config(as_conf)
         now = time.time()
         if self.log_recovery_process_alive:
-            if (self._log_recovery_started_at
-                    and now - self._log_recovery_started_at >= log_recovery.min_alive_seconds):
+            if self._log_recovery_ready is not None and self._log_recovery_ready.is_set():
                 self._recovery_consecutive_failures = 0
             return True
 
-        # A process that was started and is now gone counts as a failed attempt only when it
-        # died shortly after starting. A process that lived long enough is considered healthy.
-        if self._log_recovery_started_at:
-            if now - self._log_recovery_started_at >= log_recovery.min_alive_seconds:
-                self._recovery_consecutive_failures = 0
+        cleanup = False
+        if self._log_recovery_started_at > 0:
+            process = self.log_recovery_process
+            exitcode = process.exitcode if process is not None else None
+            ready = self._log_recovery_ready is not None and self._log_recovery_ready.is_set()
+            cleanup = self.cleanup_event is not None and self.cleanup_event.is_set()
+            lifetime = now - self._log_recovery_started_at
+
+            if cleanup:
+                classification = "cleanup"
+            elif not ready:
+                classification = "startup-failure"
+            elif exitcode == 0:
+                classification = "normal-exit"
             else:
+                classification = "post-init-crash"
+
+            failed = not cleanup and (not ready or exitcode != 0)
+
+            if failed:
                 self._recovery_consecutive_failures += 1
+            elif not cleanup:
+                self._recovery_consecutive_failures = 0
+
+            message = (
+                f"[{self.name}] log recovery exit "
+                f"pid={process.pid if process is not None else None} "
+                f"lifetime={lifetime:.1f}s ready={'yes' if ready else 'no'} "
+                f"exitcode={exitcode} class={classification} "
+                f"streak={self._recovery_consecutive_failures}"
+            )
+            if failed:
+                Log.warning(message)
+            else:
+                Log.info(message)
             self._log_recovery_started_at = 0.0
 
         if self._log_recovery_in_backoff:
@@ -897,7 +930,7 @@ class Platform:
             self._recovery_consecutive_failures = 0
 
         max_restarts = log_recovery.consecutive_max_restarts
-        if 0 < max_restarts <= self._recovery_consecutive_failures:
+        if not cleanup and 0 < max_restarts <= self._recovery_consecutive_failures:
             self._start_retry_backoff(as_conf)
             return False
 
@@ -1079,6 +1112,8 @@ class Platform:
         # Clearing the events is sufficient to give the next child process a clean initial state.
         if self.cleanup_event is not None:
             self.cleanup_event.clear()
+        if self._log_recovery_ready is not None:
+            self._log_recovery_ready.clear()
         if self.work_event is not None:
             self.work_event.clear()
             # The respawn creates a new event, do not leave stale ones in the shared list.
@@ -1136,6 +1171,9 @@ class Platform:
             Platform.update_workers(self.work_event)
         if self.cleanup_event is None:
             self.cleanup_event = self.ctx.Event()
+        if self._log_recovery_ready is None:
+            self._log_recovery_ready = self.ctx.Event()
+        self._log_recovery_ready.clear()
         self.load_process_info(new_platform)
         if self.recovery_queue is not None:
             self.recovery_queue.cancel_join_thread()
@@ -1161,8 +1199,8 @@ class Platform:
         try:
             self.log_recovery_process = self.ctx.Process(
                 target=recover_platform_job_logs_wrapper,
-                args=(new_platform, self.recovery_queue, self.work_event, self.cleanup_event, as_conf,
-                      self.recovery_results),
+                args=(new_platform, self.recovery_queue, self.work_event, self.cleanup_event,
+                      self._log_recovery_ready, as_conf, self.recovery_results),
                 name=f"{self.name}_log_recovery")
             self.log_recovery_process.daemon = True
             self.log_recovery_process.start()
@@ -1190,9 +1228,10 @@ class Platform:
         if process.is_alive():
             Log.info(f"Process {process.pid} is still running.")
         else:
+            lifetime = time.time() - self._log_recovery_started_at if self._log_recovery_started_at > 0 else 0.0
             Log.result(
                 f"Process {process.name} finished with pid {process.pid} "
-                f"(exit code {process.exitcode})")
+                f"(exit code {process.exitcode}, lifetime {lifetime:.1f}s)")
 
     def spawn_log_retrieval_process(self, as_conf: Optional['AutosubmitConfig']) -> bool:
         """Spawns a process to recover the logs of the jobs that have been completed on this platform.
@@ -1213,15 +1252,15 @@ class Platform:
         self.log_retrieval_process_active = True
         self.ctx = self.get_mp_context()
         new_platform = self.prepare_process()
+        self._log_recovery_started_at = time.time()
         self.create_new_process(new_platform, as_conf)
         self.join_new_process()
 
         alive = self.log_recovery_process_alive
         if not alive:
             self.log_retrieval_process_active = False
+            self._log_recovery_started_at = 0.0
             Log.error(f"Could not start the log recovery process for platform [{self.name}].")
-        else:
-            self._log_recovery_started_at = time.time()
         return alive
 
     def send_cleanup_signal(self) -> None:
@@ -1350,15 +1389,25 @@ class Platform:
 
     def recover_platform_job_logs(self, as_conf: 'AutosubmitConfig') -> None:
         """Recovers the logs of the jobs that have been submitted.
-        When this is executed as a process, the exit is controlled by the work_event and cleanup_events of the main process.
+
+        When this is executed as a process, the exit is controlled by the work_event and
+        cleanup_event of the main process. The child sets ``_log_recovery_ready`` after a
+        verified connection and exits with a non-zero code on failure, so the parent can
+        distinguish a normal idle exit from a crash.
         """
         self._as_conf = as_conf
         setproctitle.setproctitle(f"autosubmit log {self.expid} recovery {self.name.lower()}")
         identifier = f"{self.name.lower()}(log_recovery):"
+        failed = False
         try:
             Log.info(f"{identifier} Starting...")
             self.connected = False
             self.restore_connection(as_conf, log_recovery_process=True)
+            if not self.connected:
+                raise AutosubmitCritical(
+                    f"[{self.name}] log recovery process could not connect", 6003)
+            if self._log_recovery_ready is not None:
+                self._log_recovery_ready.set()
             Log.result(f"{identifier} successfully connected.")
             self.keep_alive_timeout = self.config.get("LOG_RECOVERY_TIMEOUT", 60 * 5)
             while not self.cleanup_event.is_set() and self.wait_for_work():
@@ -1370,6 +1419,7 @@ class Platform:
                     self.restore_connection(as_conf, log_recovery_process=True)
             self.recover_job_log()
         except Exception as e:
+            failed = True
             Log.error(f"{identifier} {e}")
             Log.debug(traceback.format_exc())
 
@@ -1379,7 +1429,7 @@ class Platform:
         Log.info(f"{identifier} Exiting.")
         # Exit userspace after manually closing ssh sockets, recommended for child processes,
         # the queue() and shared signals should be in charge of the main process.
-        _exit(0)
+        _exit(1 if failed else 0)
 
     def create_a_new_copy(self):
         raise NotImplementedError  # pragma: no cover

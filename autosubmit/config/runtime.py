@@ -30,9 +30,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from autosubmit.config.utils import as_bool, as_float, as_int, as_mapping
-from autosubmit.log.log import Log
 
 __all__ = ["LogRecoveryConfig", "RuntimeConfig", "resolve_log_recovery_queue_size"]
+
+_DEFAULT_CONSECUTIVE_MAX_RESTARTS = 2
+"""Default number of consecutive log recovery failures before the retry backoff."""
+
+_DEFAULT_RETRY_DELAY = 600.0
+"""Default seconds to wait before retrying the log recovery process after a failure."""
+
+_DEFAULT_INLINE_FALLBACK = True
+"""Whether pending logs are recovered in the main process by default while the child is unavailable."""
 
 
 @dataclass(frozen=True)
@@ -45,15 +53,11 @@ class LogRecoveryConfig:
         trying to start the recovery process again.
     :param inline_fallback: Whether pending logs are recovered in the main process while
         the separate recovery process is unavailable.
-    :param min_alive_seconds: Minimum time a recovery process must stay alive to be
-        considered healthy and reset the consecutive-restart counter. ``0`` disables the
-        grace period.
     """
 
-    consecutive_max_restarts: int = 2
-    retry_delay: float = 600.0
-    inline_fallback: bool = True
-    min_alive_seconds: float = 5.0
+    consecutive_max_restarts: int = _DEFAULT_CONSECUTIVE_MAX_RESTARTS
+    retry_delay: float = _DEFAULT_RETRY_DELAY
+    inline_fallback: bool = _DEFAULT_INLINE_FALLBACK
 
 
 @dataclass(frozen=True)
@@ -79,17 +83,6 @@ class RuntimeConfig:
         log_recovery = as_mapping(runtime.get("LOG_RECOVERY"), "RUNTIME.LOG_RECOVERY")
 
         defaults = LogRecoveryConfig()
-        min_alive_seconds = as_float(
-            log_recovery.get("MIN_ALIVE_SECONDS"),
-            defaults.min_alive_seconds,
-            "RUNTIME.LOG_RECOVERY.MIN_ALIVE_SECONDS",
-        )
-        if min_alive_seconds < 0:
-            Log.warning(
-                "Invalid value for RUNTIME.LOG_RECOVERY.MIN_ALIVE_SECONDS: "
-                f"{min_alive_seconds!r}. Using 0."
-            )
-            min_alive_seconds = 0.0
         return cls(
             log_recovery=LogRecoveryConfig(
                 consecutive_max_restarts=as_int(
@@ -107,7 +100,6 @@ class RuntimeConfig:
                     defaults.inline_fallback,
                     "RUNTIME.LOG_RECOVERY.INLINE_FALLBACK",
                 ),
-                min_alive_seconds=min_alive_seconds,
             )
         )
 

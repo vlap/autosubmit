@@ -19,6 +19,7 @@
 
 import multiprocessing as mp
 import time
+from multiprocessing import connection
 from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
@@ -107,7 +108,7 @@ def test_init_logs_log_process_no_root_dir(mocker, autosubmit_config):
     platform = mocker.MagicMock()
     mocker.patch('autosubmit.platforms.platform._exit', return_value=0)
     recover_platform_job_logs_wrapper(
-        platform, None, None, None, as_conf=as_conf, recovery_results=None)  # type: ignore
+        platform, None, None, None, None, as_conf=as_conf, recovery_results=None)  # type: ignore
 
     assert Log.console_handler.level == Log.NO_LOG
 
@@ -131,18 +132,26 @@ def test_init_logs_log_process_with_root_dir(mocker, autosubmit_config):
     current_number_of_handlers = len(Log.log.handlers)
 
     recover_platform_job_logs_wrapper(
-        platform, None, None, None, as_conf=as_conf, recovery_results=None)  # type: ignore
+        platform, None, None, None, None, as_conf=as_conf, recovery_results=None)  # type: ignore
 
     assert len(Log.log.handlers) == current_number_of_handlers + 2  # + out + err
 
 
-def _recovery_platform(as_conf, *, alive=True):
+def _recovery_platform(as_conf, *, alive=True, ready=True, exitcode=0, cleanup=False):
     """Create a LocalPlatform wired for log recovery tests."""
     ctx = mp.get_context("fork")
     platform = LocalPlatform("t000", "test_platform", {})
     platform.recovery_queue = CopyQueue(ctx=ctx)
     platform.work_event = ctx.Event()
-    platform.log_recovery_process = SimpleNamespace(is_alive=lambda: alive)
+    platform.cleanup_event = ctx.Event()
+    platform._log_recovery_ready = ctx.Event()
+    if ready:
+        platform._log_recovery_ready.set()
+    if cleanup:
+        platform.cleanup_event.set()
+    platform.log_recovery_process = SimpleNamespace(
+        is_alive=lambda: alive, exitcode=exitcode, pid=123, name="child"
+    )
     as_conf.misc_data = {"AS_COMMAND": "run"}
     return platform
 
@@ -379,12 +388,12 @@ def test_missing_ack_keeps_pending_job(mocker, autosubmit_config):
 
 
 def test_dead_process_counts_as_failure_and_backs_off(mocker, autosubmit_config):
-    """A process that dies shortly after starting counts towards the restart limit."""
+    """A process that dies before reporting readiness counts towards the restart limit."""
     as_conf = autosubmit_config("t000", {
         "RUNTIME": {"LOG_RECOVERY": {"CONSECUTIVE_MAX_RESTARTS": 1, "RETRY_DELAY": 60, "INLINE_FALLBACK": False}},
         "PLATFORMS": {"test_platform": {}},
     })
-    platform = _recovery_platform(as_conf, alive=False)
+    platform = _recovery_platform(as_conf, alive=False, ready=False)
     platform._log_recovery_started_at = time.time() - 1
     mocker.patch.object(platform, "clean_log_recovery_process")
     spawn = mocker.patch.object(platform, "spawn_log_retrieval_process", return_value=False)
@@ -394,8 +403,8 @@ def test_dead_process_counts_as_failure_and_backs_off(mocker, autosubmit_config)
     spawn.assert_not_called()
 
 
-def test_long_lived_dead_process_does_not_back_off(mocker, autosubmit_config):
-    """A process that died after living long enough is not treated as a crash loop."""
+def test_ready_process_with_zero_exit_does_not_back_off(mocker, autosubmit_config):
+    """A ready process that exited zero is a normal exit, not a crash loop."""
     as_conf = autosubmit_config("t000", {
         "RUNTIME": {"LOG_RECOVERY": {"CONSECUTIVE_MAX_RESTARTS": 1, "RETRY_DELAY": 60, "INLINE_FALLBACK": False}},
         "PLATFORMS": {"test_platform": {}},
@@ -442,7 +451,7 @@ def test_zero_max_restarts_never_backs_off(mocker, autosubmit_config):
         "RUNTIME": {"LOG_RECOVERY": {"CONSECUTIVE_MAX_RESTARTS": 0}},
         "PLATFORMS": {"test_platform": {}},
     })
-    platform = _recovery_platform(as_conf, alive=False)
+    platform = _recovery_platform(as_conf, alive=False, ready=False)
     platform._log_recovery_started_at = time.time() - 60
     platform._recovery_consecutive_failures = 10
     mocker.patch.object(platform, "clean_log_recovery_process")
@@ -511,18 +520,21 @@ def _noop():
     pass
 
 
+@pytest.mark.skipif(
+    "fork" not in mp.get_all_start_methods(),
+    reason="The fork start method is not available on this platform",
+)
 def test_join_new_process_reaps_exited_child():
-    """After join_new_process, an exited child is reaped and is_alive() is false."""
-    try:
-        ctx = mp.get_context("fork")
-    except ValueError:
-        pytest.skip("The fork context is not available on this platform")
-
+    """join_new_process is the only call that reaps the exited child."""
+    ctx = mp.get_context("fork")
     process = ctx.Process(target=_noop)
     process.start()
     platform = LocalPlatform("t000", "test_platform", {})
     platform.log_recovery_process = process
     try:
+        ready = connection.wait([process.sentinel], timeout=5)
+        assert process.sentinel in ready
+
         deadline = time.time() + 5
         status = None
         while time.time() < deadline:
@@ -532,16 +544,14 @@ def test_join_new_process_reaps_exited_child():
                 break
             if status == psutil.STATUS_ZOMBIE:
                 break
-            time.sleep(0.05)
-        if status != psutil.STATUS_ZOMBIE:
-            pytest.skip("The child was not observed as a zombie on this platform")
+            time.sleep(0.01)
+        assert status == psutil.STATUS_ZOMBIE, f"Expected a zombie, got {status!r}"
 
         platform.join_new_process()
 
-        assert process.is_alive() is False
-        assert process.exitcode == 0
         with pytest.raises(psutil.NoSuchProcess):
             psutil.Process(process.pid).status()
+        assert process.exitcode == 0
     finally:
         if process.is_alive():
             process.kill()
@@ -549,28 +559,119 @@ def test_join_new_process_reaps_exited_child():
 
 
 @pytest.mark.parametrize(
-    "min_alive_seconds,elapsed,expected_failures",
-    [
-        (1.0, 5.0, 0),
-        (10.0, 5.0, 3),
-    ],
-    ids=["alive-enough", "not-alive-enough"],
+    "ready,expected_failures",
+    [(False, 3), (True, 0)],
+    ids=["not-ready", "ready"],
 )
-def test_min_alive_seconds_is_configurable(
-    mocker, autosubmit_config, min_alive_seconds, elapsed, expected_failures
-):
-    """The grace period comes from RUNTIME.LOG_RECOVERY.MIN_ALIVE_SECONDS."""
-    as_conf = autosubmit_config("t000", {
-        "RUNTIME": {"LOG_RECOVERY": {"MIN_ALIVE_SECONDS": min_alive_seconds}},
-        "PLATFORMS": {"test_platform": {}},
-    })
-    platform = _recovery_platform(as_conf)
+def test_alive_process_resets_only_when_ready(autosubmit_config, ready, expected_failures):
+    """A live child resets the streak only after it reports readiness."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    platform = _recovery_platform(as_conf, ready=ready)
     platform._recovery_consecutive_failures = 3
-    platform._log_recovery_started_at = 1000.0 - elapsed
-    mocker.patch("autosubmit.platforms.platform.time.time", return_value=1000.0)
 
     assert platform.try_respawn_log_recovery_process(as_conf) is True
     assert platform._recovery_consecutive_failures == expected_failures
+
+
+@pytest.mark.parametrize(
+    "ready,exitcode,cleanup,initial_failures,expected_failures",
+    [
+        (False, 0, False, 0, 1),
+        (False, 1, False, 0, 1),
+        (True, 1, False, 0, 1),
+        (True, 0, False, 0, 0),
+        (True, None, False, 0, 1),
+        (True, 1, True, 3, 3),
+        (True, 0, True, 3, 3),
+    ],
+    ids=[
+        "never-ready-zero",
+        "never-ready-one",
+        "post-init-crash",
+        "normal-exit",
+        "unknown-exit",
+        "cleanup-crash",
+        "cleanup-normal",
+    ],
+)
+def test_dead_process_classification(
+    autosubmit_config,
+    mocker,
+    ready,
+    exitcode,
+    cleanup,
+    initial_failures,
+    expected_failures,
+):
+    """A dead child is classified by readiness, exit code, and cleanup state."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    platform = _recovery_platform(
+        as_conf, alive=False, ready=ready, exitcode=exitcode, cleanup=cleanup
+    )
+    platform._log_recovery_started_at = time.time() - 1
+    platform._recovery_consecutive_failures = initial_failures
+    mocker.patch.object(platform, "clean_log_recovery_process")
+    mocker.patch.object(platform, "spawn_log_retrieval_process", return_value=True)
+
+    assert platform.try_respawn_log_recovery_process(as_conf) is True
+    assert platform._recovery_consecutive_failures == expected_failures
+
+
+def _recovery_child_platform(as_conf, mocker):
+    platform = LocalPlatform("t000", "test_platform", {})
+    platform.ctx = mp.get_context("fork")
+    platform.cleanup_event = platform.ctx.Event()
+    platform.cleanup_event.set()
+    platform.work_event = platform.ctx.Event()
+    platform._log_recovery_ready = platform.ctx.Event()
+    platform._as_conf = as_conf
+    mocker.patch("setproctitle.setproctitle")
+    mocker.patch.object(platform, "recover_job_log")
+    mocker.patch.object(platform, "close_connection")
+    return platform
+
+
+def test_recover_platform_job_logs_sets_ready_and_exits_zero(autosubmit_config, mocker):
+    """The child reports readiness after connecting and exits zero on a clean stop."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    platform = _recovery_child_platform(as_conf, mocker)
+
+    def _connect(*_args, **_kwargs):
+        platform.connected = True
+
+    mocker.patch.object(platform, "restore_connection", side_effect=_connect)
+    exit_mock = mocker.patch("autosubmit.platforms.platform._exit")
+
+    platform.recover_platform_job_logs(as_conf)
+
+    assert platform._log_recovery_ready.is_set() is True
+    exit_mock.assert_called_once_with(0)
+
+
+def test_recover_platform_job_logs_exits_non_zero_on_failure(autosubmit_config, mocker):
+    """A child that cannot start must exit non-zero and must not report readiness."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    platform = _recovery_child_platform(as_conf, mocker)
+    mocker.patch.object(platform, "restore_connection", side_effect=Exception("boom"))
+    exit_mock = mocker.patch("autosubmit.platforms.platform._exit")
+
+    platform.recover_platform_job_logs(as_conf)
+
+    assert platform._log_recovery_ready.is_set() is False
+    exit_mock.assert_called_once_with(1)
+
+
+def test_recover_platform_job_logs_exits_non_zero_when_not_connected(autosubmit_config, mocker):
+    """A connection that returns without an error but leaves connected false is a failure."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    platform = _recovery_child_platform(as_conf, mocker)
+    mocker.patch.object(platform, "restore_connection")
+    exit_mock = mocker.patch("autosubmit.platforms.platform._exit")
+
+    platform.recover_platform_job_logs(as_conf)
+
+    assert platform._log_recovery_ready.is_set() is False
+    exit_mock.assert_called_once_with(1)
 
 
 def test_recovery_queue_is_bounded_by_log_queue_size():

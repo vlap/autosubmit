@@ -10,7 +10,13 @@
 
 **New Features:**
 
-- Added `RUNTIME.LOG_RECOVERY` options to configure log recovery resiliency: `CONSECUTIVE_MAX_RESTARTS` (consecutive restart attempts before waiting to retry, default `2`, `0` disables the limit), `RETRY_DELAY` (seconds to wait after exhausting those attempts before trying to start the recovery process again, default `600`), `MIN_ALIVE_SECONDS` (minimum time a recovery process must stay alive to be considered healthy, default `5`) and `INLINE_FALLBACK` (recover pending logs in the main process while the separate process is unavailable, default `true`) #3342
+- Added `RUNTIME.LOG_RECOVERY` options to configure log recovery resiliency:
+  `CONSECUTIVE_MAX_RESTARTS` (consecutive restart attempts before waiting to retry,
+  default `2`, `0` disables the limit),
+  `RETRY_DELAY` (seconds to wait after exhausting those attempts before trying to
+  start the recovery process again, default `600`) and
+  `INLINE_FALLBACK` (recover pending logs in the main process while the separate
+  process is unavailable, default `true`) #3342
 
 ### 4.1.17.2: SSH transport recovery (port of #3309)
 

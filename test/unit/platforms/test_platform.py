@@ -353,7 +353,18 @@ def test_join_new_process_reaps_exited_child():
     try:
         ready = connection.wait([process.sentinel], timeout=5)
         assert process.sentinel in ready
-        assert psutil.Process(process.pid).status() == psutil.STATUS_ZOMBIE
+
+        deadline = time.time() + 5
+        status = None
+        while time.time() < deadline:
+            try:
+                status = psutil.Process(process.pid).status()
+            except psutil.NoSuchProcess:
+                break
+            if status == psutil.STATUS_ZOMBIE:
+                break
+            time.sleep(0.01)
+        assert status == psutil.STATUS_ZOMBIE, f"Expected a zombie, got {status!r}"
 
         platform.join_new_process()
 

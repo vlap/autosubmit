@@ -1226,9 +1226,9 @@ class Platform(ABC):
         if not self.should_run_log_recovery(as_conf):
             return False
 
-        self.log_retrieval_process_active = True
         self.ctx = self.get_mp_context()
         new_platform = self.prepare_process()
+        self.log_retrieval_process_active = True
         self._log_recovery_started_at = time.time()
         self.create_new_process(new_platform, as_conf)
         self.join_new_process()

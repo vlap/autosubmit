@@ -422,6 +422,19 @@ def test_spawn_resets_active_flag_when_process_is_dead(mocker, autosubmit_config
     assert platform._log_recovery_started_at > 0
 
 
+def test_spawn_does_not_leave_active_flag_when_prepare_process_raises(mocker, autosubmit_config):
+    """A prepare_process failure must not leave the active flag set."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    as_conf.misc_data = {"AS_COMMAND": "run"}
+    platform = LocalPlatform("t000", "test_platform", {})
+    mocker.patch.object(platform, "prepare_process", side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        platform.spawn_log_retrieval_process(as_conf)
+
+    assert platform.log_retrieval_process_active is False
+
+
 @pytest.mark.parametrize(
     "ready,exitcode,cleanup,initial_failures,expected_failures",
     [

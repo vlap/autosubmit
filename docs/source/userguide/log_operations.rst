@@ -110,8 +110,8 @@ live in the ``RUNTIME`` section of the experiment configuration.
         start of the process.
 
 The recovery process is considered healthy once it has connected to the platform
-and it exits with code ``0``. A process that dies before connecting, or that exits
-with a non-zero code after connecting, counts as a failed attempt.
+and exits with code ``0``. It counts as a failed attempt if it dies before
+connecting, or if it exits with a non-zero code after connecting.
 
 Example:
 

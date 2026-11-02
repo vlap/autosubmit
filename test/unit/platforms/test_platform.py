@@ -617,6 +617,44 @@ def test_dead_process_classification(
     assert platform._recovery_consecutive_failures == expected_failures
 
 
+def test_spawn_resets_active_flag_when_process_is_dead(mocker, autosubmit_config):
+    """A stale active flag must not prevent a new recovery process from starting."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    as_conf.misc_data = {"AS_COMMAND": "run"}
+    platform = LocalPlatform("t000", "test_platform", {})
+    platform.log_retrieval_process_active = True
+    platform.log_recovery_process = SimpleNamespace(is_alive=lambda: False, pid=123, name="child")
+    mocker.patch.object(platform, "prepare_process", return_value=None)
+    mocker.patch.object(platform, "join_new_process")
+
+    def _start_new_process(*_args, **_kwargs):
+        platform.log_recovery_process = SimpleNamespace(is_alive=lambda: True, pid=456, name="child")
+
+    mocker.patch.object(platform, "create_new_process", side_effect=_start_new_process)
+
+    # The stale flag is cleared and this call cannot spawn.
+    assert platform.spawn_log_retrieval_process(as_conf) is False
+    assert platform.log_retrieval_process_active is False
+
+    # A later call starts a new process.
+    assert platform.spawn_log_retrieval_process(as_conf) is True
+    assert platform.log_retrieval_process_active is True
+    assert platform._log_recovery_started_at > 0
+
+
+def test_spawn_does_not_leave_active_flag_when_prepare_process_raises(mocker, autosubmit_config):
+    """A prepare_process failure must not leave the active flag set."""
+    as_conf = autosubmit_config("t000", {"PLATFORMS": {"test_platform": {}}})
+    as_conf.misc_data = {"AS_COMMAND": "run"}
+    platform = LocalPlatform("t000", "test_platform", {})
+    mocker.patch.object(platform, "prepare_process", side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        platform.spawn_log_retrieval_process(as_conf)
+
+    assert platform.log_retrieval_process_active is False
+
+
 def _recovery_child_platform(as_conf, mocker):
     platform = LocalPlatform("t000", "test_platform", {})
     platform.ctx = mp.get_context("fork")

@@ -2800,6 +2800,7 @@ class Autosubmit:
 
             pkl_dir = os.path.join(BasicConfig.LOCAL_ROOT_DIR, expid, 'pkl')
             job_list = Autosubmit.load_job_list(expid, as_conf, new=False)
+            as_conf.reload()
             for job in job_list.get_job_list():
                 job._init_runtime_parameters()
                 job.update_parameters(as_conf, set_attributes=True)

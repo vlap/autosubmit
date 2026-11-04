@@ -164,6 +164,7 @@ def initialize_autosubmitrc(tmp_path: 'LocalPath', request: 'FixtureRequest', au
 
     os.environ['AUTOSUBMIT_CONFIGURATION'] = str(autosubmitrc)
 
+    BasicConfig.reset()
     BasicConfig.read()
     generate_dirs()
 

@@ -321,6 +321,16 @@ def test_get_job_by_name_returns_the_expected_job(job_list_no_repeated_ids, jobs
     assert completed_job == job
 
 
+def test_get_job_by_name_graph_lookup(job_list_no_repeated_ids, jobs_as_dict):
+    from networkx import DiGraph
+    completed_job = jobs_as_dict[Status.COMPLETED][0]
+    job_list_no_repeated_ids.graph = DiGraph()
+    job_list_no_repeated_ids.graph.add_node(completed_job.name, job=completed_job)
+    retrieved = job_list_no_repeated_ids.get_job_by_name(completed_job.name)
+    assert retrieved is completed_job
+    assert job_list_no_repeated_ids.get_job_by_name("non_existent_job_xyz") is None
+
+
 def test_sort_by_name_returns_the_list_of_jobs_well_sorted(job_list_no_repeated_ids):
     sorted_by_name = job_list_no_repeated_ids.sort_by_name()
 
@@ -1102,3 +1112,81 @@ def test_recover_logs(job_list, mocker, job, expected_calls):
     if expected_calls == 0:
         assert job.updated_log == job.fail_count + 1
         assert job_list.recover_logs() is False
+
+
+def test_recursion_print_deep_chain(as_conf):
+    """Print a deep chain of 1,500 jobs without RecursionError."""
+    job_list = JobList("a000", as_conf, YAMLParserFactory(), JobListPersistencePkl())
+    chain_length = 1500
+    jobs = [Job(f"job_{i:04d}", str(i), Status.READY, 0) for i in range(chain_length)]
+    for i in range(chain_length - 1):
+        jobs[i]._children.add(jobs[i + 1])
+
+    visited = []
+    output = job_list._recursion_print(jobs[0], 0, visited, nocolor=True)
+
+    assert len(visited) == chain_length
+    for job in jobs:
+        assert job.name in output
+
+
+def test_recursion_print_branched_graph_respects_visited(as_conf):
+    """Verify visited tracking prevents duplicate branches in shared subtrees."""
+    job_list = JobList("a000", as_conf, YAMLParserFactory(), JobListPersistencePkl())
+
+    r1 = Job("root1", "1", Status.READY, 0)
+    r2 = Job("root2", "2", Status.READY, 0)
+    b_a = Job("branch_a", "3", Status.READY, 0)
+    b_b = Job("branch_b", "4", Status.READY, 0)
+    b_c = Job("branch_c", "5", Status.READY, 0)
+    leaf_shared = Job("leaf_shared", "6", Status.COMPLETED, 0)
+    leaf_c = Job("leaf_c", "7", Status.COMPLETED, 0)
+
+    # r1 -> branch_a, branch_b
+    r1._children.update([b_a, b_b])
+    # r2 -> branch_b, branch_c
+    r2._children.update([b_b, b_c])
+    # branch_a -> leaf_shared; branch_b -> leaf_shared
+    b_a._children.add(leaf_shared)
+    b_b._children.add(leaf_shared)
+    # branch_c -> leaf_c
+    b_c._children.add(leaf_c)
+
+    visited = []
+    out1 = job_list._recursion_print(r1, 0, visited, nocolor=True)
+    out2 = job_list._recursion_print(r2, 0, visited, nocolor=True)
+
+    expected_visited = ["root1", "branch_a", "leaf_shared", "branch_b", "root2", "branch_c", "leaf_c"]
+    assert visited == expected_visited
+
+    full_output = out1 + out2
+    for job_name in expected_visited:
+        assert full_output.count(job_name) == 1
+
+    # Calling again with visited list must return empty string
+    out3 = job_list._recursion_print(r1, 0, visited, nocolor=True)
+    assert out3 == ""
+    assert visited == expected_visited
+
+
+def test_recursion_print_preorder_and_status_change(as_conf):
+    """Verify pre-order child sorting and status change annotations."""
+    job_list = JobList("a000", as_conf, YAMLParserFactory(), JobListPersistencePkl())
+
+    parent = Job("parent", "1", Status.READY, 0)
+    child_z = Job("child_z", "2", Status.WAITING, 0)
+    child_a = Job("child_a", "3", Status.WAITING, 0)
+    parent._children.update([child_z, child_a])
+
+    status_change = {"parent": " -> RUNNING"}
+    output = job_list._recursion_print(parent, 0, visited=[], statusChange=status_change, nocolor=True)
+
+    # child_a must appear before child_z
+    pos_a = output.find("child_a")
+    pos_z = output.find("child_z")
+    assert pos_a != -1 and pos_z != -1
+    assert pos_a < pos_z
+    assert "-> RUNNING" in output
+    assert "~ [2 children]" in output
+    assert job_list._recursion_print(None, 0) == ""
+

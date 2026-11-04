@@ -21,6 +21,7 @@ import math
 import os
 import re
 import traceback
+from collections import deque
 from contextlib import suppress
 from itertools import groupby
 from pathlib import Path
@@ -2274,6 +2275,10 @@ class JobList(object):
         :return: found job
         :rtype: job
         """
+        if hasattr(self, "graph") and self.graph is not None and name in self.graph.nodes:
+            node_data = self.graph.nodes.get(name)
+            if node_data and "job" in node_data:
+                return node_data["job"]
         for job in self._job_list:
             if job.name == name:
                 return job
@@ -3241,60 +3246,68 @@ class JobList(object):
             return 'Job List object'
         return "\n".join(results)
 
-    def _recursion_print(self, job, level, visited=[], statusChange=None, nocolor=False):
-        """Returns the list of children in a recursive way
-        Traverses the dependency tree
+    def _recursion_print(self, job, level, visited=[], statusChange=None, nocolor=False) -> str:
+        """Traverse the dependency tree using iterative DFS and return the formatted hierarchy.
 
-        :param job: Job object
-        :type job: Job
-        :param level: Level of the tree
-        :type level: int
-        :param visited: List of visited jobs
-        :type visited: list
-        :param statusChange: List of changes in the list, supplied in set status
-        :type statusChange: List of strings
+        Uses an explicit stack rather than recursion to avoid stack overflow on deep DAGs.
 
-        :return: parent + list of children
-        :rtype: String
+        :param job: Root job to start printing from
+        :param level: Indentation level of the root job in the tree
+        :param visited: List or set of visited job names to track visited nodes
+        :param statusChange: Dictionary of pending status changes keyed by job name
+        :param nocolor: True to disable ANSI color codes in output
+        :return: Formatted tree string representing parent and children jobs
         """
-        result = ""
-        if job.name not in visited:
-            visited.append(job.name)
-            prefix = ""
-            for i in range(level):
-                prefix += "|  "
+        if job is None:
+            return ""
+
+        visited_set = set(visited) if visited else set()
+        stack = deque([(job, level)])
+        results = []
+
+        while stack:
+            curr_job, curr_level = stack.pop()
+            if curr_job.name in visited_set:
+                continue
+
+            visited_set.add(curr_job.name)
+            if isinstance(visited, list):
+                visited.append(curr_job.name)
+            elif isinstance(visited, set):
+                visited.add(curr_job.name)
+
+            prefix = "|  " * curr_level
             # Prefix + Job Name
-            result = "\n" + prefix + \
-                     (bcolors.BOLD + bcolors.CODE_TO_COLOR[job.status]
-                      if nocolor is False else '') + job.name + \
-                     (bcolors.ENDC + bcolors.ENDC if nocolor is False else '')
-            if len(job._children) > 0:
-                level += 1
-                children = job._children
-                total_children = len(job._children)
+            line = "\n" + prefix + \
+                   (bcolors.BOLD + bcolors.CODE_TO_COLOR[curr_job.status]
+                    if nocolor is False else '') + curr_job.name + \
+                   (bcolors.ENDC + bcolors.ENDC if nocolor is False else '')
+            if len(curr_job._children) > 0:
+                children = curr_job._children
+                total_children = len(curr_job._children)
                 # Writes children number and status if color are not being showed
-                result += (" ~ [" + str(total_children) +
-                           (" children] " if total_children > 1 else " child] ") +
-                           ("[" + Status.VALUE_TO_KEY[job.status] + "] " if nocolor is True else "")
-                           )
+                line += (" ~ [" + str(total_children) +
+                         (" children] " if total_children > 1 else " child] ") +
+                         ("[" + Status.VALUE_TO_KEY[curr_job.status] + "] " if nocolor is True else "")
+                         )
                 if statusChange is not None and len(str(statusChange)) > 0:
                     # Writes change if performed
-                    result += (bcolors.BOLD +
-                               bcolors.OKGREEN if nocolor is False else '')
-                    result += (statusChange[job.name]
-                               if job.name in statusChange else "")
-                    result += (bcolors.ENDC +
-                               bcolors.ENDC if nocolor is False else "")
+                    line += (bcolors.BOLD +
+                             bcolors.OKGREEN if nocolor is False else '')
+                    line += (statusChange[curr_job.name]
+                             if curr_job.name in statusChange else "")
+                    line += (bcolors.ENDC +
+                             bcolors.ENDC if nocolor is False else "")
                 # order by name, this is for compare 4.0 with 4.1 as the children order is different
-                for child in sorted(children, key=lambda x: x.name):
-                    # Continues recursion
-                    result += self._recursion_print(
-                        child, level, visited, statusChange=statusChange, nocolor=nocolor)
+                for child in sorted(children, key=lambda x: x.name, reverse=True):
+                    stack.append((child, curr_level + 1))
             else:
-                result += (" [" + Status.VALUE_TO_KEY[job.status] +
-                           "] " if nocolor is True else "")
+                line += (" [" + Status.VALUE_TO_KEY[curr_job.status] +
+                         "] " if nocolor is True else "")
 
-        return result
+            results.append(line)
+
+        return "".join(results)
 
     @staticmethod
     def retrieve_packages(BasicConfig, expid, current_jobs=None):

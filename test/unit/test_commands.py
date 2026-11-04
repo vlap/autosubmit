@@ -16,6 +16,8 @@
 # along with Autosubmit.  If not, see <http://www.gnu.org/licenses/>.
 
 from typing import Optional
+import subprocess
+import sys
 
 import pytest
 
@@ -132,3 +134,15 @@ def test_command_accepts_section_splits_in_ft(mocker, command):
     assert status == 0
     assert args.command == command
     assert args.filter_type == "LOCALJOB [ 1 2 5-8 ]"
+
+
+def test_python_m_autosubmit_version():
+    """Test that python -m autosubmit -v executes successfully."""
+    result = subprocess.run(
+        [sys.executable, "-m", "autosubmit", "-v"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "4.1.17.2" in (result.stdout + result.stderr)
+
